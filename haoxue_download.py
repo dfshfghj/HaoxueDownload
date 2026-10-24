@@ -12,6 +12,7 @@ import sys
 import time
 import os
 import platform
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
@@ -343,43 +344,93 @@ def print_sub_records(data, hidden_subjects: list | None = None) -> None:
         print("Subject response keys:", ", ".join(sorted(data)))
 
 
-def print_video_info(data) -> str:
+def classify_media_url(url: str) -> str:
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    if suffix == ".m3u8":
+        return "hls"
+    if suffix in {".mp4", ".m4v", ".mov", ".mkv", ".flv", ".webm", ".ts"}:
+        return "file"
+    return "unknown"
+
+
+def _http_url(value) -> str:
+    text = unescape(str(value or "")).strip()
+    return text if text.startswith(("http://", "https://")) else ""
+
+
+def extract_media_candidates(data) -> list[dict]:
+    """Collect every media URL the sub-detail response exposes.
+
+    Processed replays are usually HLS, while freshly published ones can be a
+    plain MP4 served from httpDownload.  Keep the API's order and de-duplicate
+    by host/path so an expiring query string cannot create duplicates.
+    """
     if not isinstance(data, dict):
         debug("Video info data shape:", response_shape(json.dumps(data)))
-        return ""
+        return []
     video_data = data.get("data", data)
     if not isinstance(video_data, dict):
         debug("Video info data shape:", response_shape(json.dumps(video_data)))
-        return ""
+        return []
     debug("Video info keys:", ", ".join(sorted(video_data)))
+    raw: list[tuple[str, str, int]] = []
     choices = video_data.get("videoArr") or []
-    media_url = ""
-    debug(f"Video choices: {len(choices)}")
-    for item in choices:
-        if not isinstance(item, dict):
-            continue
-        raw_url = str(item.get("path", ""))
-        if not media_url and raw_url:
-            media_url = raw_url
-        parsed = urlsplit(raw_url)
-        debug(
-            f"  tag={item.get('tag')}, select={item.get('select')}, "
-            f"file_size={item.get('file_size')}, scheme={parsed.scheme}, "
-            f"host={parsed.netloc}, path={parsed.path}, query_keys="
-            f"{','.join(sorted({part.split('=', 1)[0] for part in parsed.query.split('&') if part}))}"
-        )
+    debug(f"Video choices: {len(choices) if isinstance(choices, list) else 0}")
+    if isinstance(choices, list):
+        for item in choices:
+            if not isinstance(item, dict):
+                continue
+            url = _http_url(item.get("path"))
+            if not url:
+                continue
+            try:
+                size = int(item.get("file_size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            parsed = urlsplit(url)
+            debug(
+                f"  tag={item.get('tag')}, size={size}, host={parsed.netloc}, "
+                f"path={parsed.path}, query_keys="
+                f"{','.join(sorted({part.split('=', 1)[0] for part in parsed.query.split('&') if part}))}"
+            )
+            raw.append((url, str(item.get("tag") or "video"), size))
     sub_content = video_data.get("sub_content") or {}
     if isinstance(sub_content, dict):
         saved = sub_content.get("save_playback") or {}
-        if isinstance(saved, dict) and saved.get("contents"):
-            parsed = urlsplit(str(saved["contents"]))
-            debug(
-                "Fallback save_playback.contents: "
-                f"scheme={parsed.scheme}, host={parsed.netloc}, path={parsed.path}"
-            )
-            if not media_url:
-                media_url = str(saved["contents"])
-    return media_url
+        if isinstance(saved, dict):
+            raw.append((_http_url(saved.get("contents")), "saved playback", 0))
+        playback = sub_content.get("playback") or {}
+        if isinstance(playback, dict):
+            raw.append((_http_url(playback.get("url")), "playback", 0))
+        files = sub_content.get("file_list") or []
+        if isinstance(files, list):
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                url = _http_url(item.get("file_name"))
+                if url and classify_media_url(url) == "file":
+                    raw.append((url, str(item.get("file_type") or "file"), 0))
+        firm = sub_content.get("firm_source") or {}
+        if isinstance(firm, dict):
+            raw.append((_http_url(firm.get("contents")), "cloud source", 0))
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for url, label, size in raw:
+        if not url:
+            continue
+        absolute = urlsplit(url)
+        identity = urlunsplit((absolute.scheme, absolute.netloc, absolute.path, "", ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidates.append({
+            "url": url,
+            "label": label,
+            "size": size,
+            "kind": classify_media_url(url),
+        })
+    return candidates
 
 
 def _time_slot_key(title: str) -> str:
@@ -525,6 +576,21 @@ def format_time(seconds: float) -> str:
     return f"{seconds // 3600:02}:{seconds % 3600 // 60:02}:{seconds % 60:02}"
 
 
+def describe_exception(exc: Exception) -> str:
+    """Describe an error without echoing URLs that may carry access tokens."""
+    status = getattr(getattr(exc, "response", None), "status_code", "")
+    return f"{type(exc).__name__}{f' HTTP {status}' if status else ''}"
+
+
+def format_bytes(value: float) -> str:
+    value = max(0.0, float(value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
 def run_ffmpeg_with_progress(command: list[str], duration: float) -> int:
     command = [*command[: command.index("-i")], "-progress", "pipe:1", "-nostats", *command[command.index("-i"):]]
     stderr = None if VERBOSE else subprocess.DEVNULL
@@ -589,10 +655,21 @@ def fetch_media_playlist(
         raise RuntimeError("HLS playlist nesting is too deep")
     response = session.get(
         playlist_url, headers={"User-Agent": UA, **headers}, timeout=30,
-        allow_redirects=True,
+        allow_redirects=True, stream=True,
     )
-    response.raise_for_status()
-    body = response.text
+    try:
+        response.raise_for_status()
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=256 * 1024):
+            if chunk:
+                content.extend(chunk)
+                if len(content) > 16 * 1024 * 1024:
+                    raise RuntimeError("HLS playlist exceeds 16 MiB; refusing unsafe response")
+        body = bytes(content).decode(response.encoding or "utf-8", errors="replace")
+    finally:
+        response.close()
+    if "#EXTM3U" not in body[:4096]:
+        raise RuntimeError("media URL did not return an HLS playlist")
     lines = [line.strip() for line in body.splitlines() if line.strip()]
     variants: list[tuple[int, str]] = []
     for index, line in enumerate(lines):
@@ -746,12 +823,16 @@ def cache_hls_playlist(
 def resumable_hls_download(
     session: requests.Session, media_url: str, media_cookie: str,
     output_path: Path, ffmpeg: str,
+    playlist: tuple[str, str] | None = None,
 ) -> None:
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cache_dir = output_path.parent / f"{output_path.name}.segments"
     headers = {"Cookie": f"_token={media_cookie}"}
-    playlist_url, body = fetch_media_playlist(session, media_url, headers)
+    if playlist is None:
+        playlist_url, body = fetch_media_playlist(session, media_url, headers)
+    else:
+        playlist_url, body = playlist
     duration = playlist_duration(body)
     local_playlist, downloaded, total = cache_hls_playlist(
         session, playlist_url, body, cache_dir, headers,
@@ -777,6 +858,157 @@ def resumable_hls_download(
     shutil.rmtree(cache_dir)
     print("Saved:", output_path)
     print("Segment cache removed.")
+
+
+def resumable_file_download(
+    session: requests.Session, media_url: str, media_cookie: str,
+    output_path: Path, expected_size: int = 0,
+) -> None:
+    """Download a plain media file with HTTP Range resume support."""
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        output_path.stem + ".part" + (output_path.suffix or ".mp4")
+    )
+    offset = temporary.stat().st_size if temporary.is_file() else 0
+    headers = {"User-Agent": UA, "Cookie": f"_token={media_cookie}"}
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+
+    with session.get(
+        media_url, headers=headers, timeout=60, allow_redirects=True, stream=True,
+    ) as response:
+        if response.status_code == 416 and offset:
+            match = re.search(r"/(\d+)\s*$", response.headers.get("Content-Range", ""))
+            total = int(match.group(1)) if match else expected_size
+            if total and offset >= total:
+                temporary.replace(output_path)
+                print("Already complete; saved:", output_path)
+                return
+        response.raise_for_status()
+        if response.status_code == 206:
+            match = re.search(r"/(\d+)\s*$", response.headers.get("Content-Range", ""))
+            if match:
+                total = int(match.group(1))
+            else:
+                length = int(response.headers.get("Content-Length", "0") or 0)
+                total = offset + length if length else 0
+            mode = "ab"
+        else:
+            if offset:
+                print("Server ignored the resume request; restarting from zero.")
+                offset = 0
+            total = int(response.headers.get("Content-Length", "0") or 0) or expected_size
+            mode = "wb"
+        total = total or expected_size
+        print(
+            f"Starting direct download"
+            f"{f' (resuming at {format_bytes(offset)})' if offset else ''}; "
+            "URL and cookie are hidden."
+        )
+        written = offset
+        started_at = time.monotonic()
+        with temporary.open(mode) as output:
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                output.write(chunk)
+                written += len(chunk)
+                elapsed = max(time.monotonic() - started_at, 1e-6)
+                if total > 0:
+                    ratio = min(written / total, 1.0)
+                    width = 32
+                    bar = "#" * int(width * ratio) + "-" * (width - int(width * ratio))
+                    speed = (written - offset) / elapsed
+                    eta = (total - written) / speed if speed > 0 else 0
+                    print(
+                        f"\rDownload [{bar}] {ratio * 100:5.1f}% "
+                        f"{format_bytes(written)}/{format_bytes(total)} "
+                        f"elapsed {format_time(elapsed)} ETA {format_time(eta)}",
+                        end="", flush=True,
+                    )
+                else:
+                    print(
+                        f"\rDownload {format_bytes(written)} "
+                        f"elapsed {format_time(elapsed)}",
+                        end="", flush=True,
+                    )
+    print()
+    final_size = temporary.stat().st_size
+    if total and final_size != total:
+        raise IOError(f"incomplete download: expected {total} bytes, received {final_size}")
+    temporary.replace(output_path)
+    print("Saved:", output_path)
+
+
+def read_media_prefix(
+    session: requests.Session, url: str, headers: dict[str, str], limit: int = 64 * 1024,
+) -> tuple[str, bytes, int, str]:
+    """Read a small response prefix without pulling a whole media file."""
+    response = session.get(
+        url, headers={"User-Agent": UA, **headers}, timeout=30,
+        allow_redirects=True, stream=True,
+    )
+    try:
+        response.raise_for_status()
+        prefix = bytearray()
+        for chunk in response.iter_content(chunk_size=8 * 1024):
+            if chunk:
+                prefix.extend(chunk)
+                if len(prefix) >= limit:
+                    break
+        raw_length = response.headers.get("Content-Length", "")
+        length = int(raw_length) if raw_length.isdigit() else 0
+        return response.url, bytes(prefix), length, response.headers.get("Content-Type", "")
+    finally:
+        response.close()
+
+
+def probe_media(
+    session: requests.Session, candidate: dict, headers: dict[str, str],
+) -> dict | None:
+    """Return download details for one candidate URL, or None when unusable."""
+    url = candidate["url"]
+    if candidate["kind"] == "hls":
+        try:
+            playlist_url, body = fetch_media_playlist(session, url, headers)
+        except Exception as exc:
+            debug(f"HLS probe failed ({describe_exception(exc)})")
+            return None
+        return {
+            **candidate,
+            "kind": "hls",
+            "playlist_url": playlist_url,
+            "body": body,
+            "duration": playlist_duration(body),
+        }
+    try:
+        _, prefix, length, content_type = read_media_prefix(session, url, headers)
+    except Exception as exc:
+        debug(f"Media probe failed ({describe_exception(exc)})")
+        return None
+    if not prefix:
+        debug("Media probe returned an empty response")
+        return None
+    if b"#EXTM3U" in prefix[:4096]:
+        try:
+            playlist_url, body = fetch_media_playlist(session, url, headers)
+        except Exception as exc:
+            debug(f"HLS probe failed ({describe_exception(exc)})")
+            return None
+        return {
+            **candidate,
+            "kind": "hls",
+            "playlist_url": playlist_url,
+            "body": body,
+            "duration": playlist_duration(body),
+        }
+    return {
+        **candidate,
+        "kind": "file",
+        "content_type": content_type or "unknown type",
+        "size": candidate["size"] or length,
+    }
 
 
 def fetch_all_courses(session: requests.Session, search: str, api_token: str) -> list[dict]:
@@ -982,7 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             show_response(response, response.text)
             video_data = json_data(response)
-            media_url = print_video_info(video_data)
+            media_candidates = extract_media_candidates(video_data)
             course_name = video_data.get("course_name") if isinstance(video_data, dict) else None
             replay_title = video_data.get("title") if isinstance(video_data, dict) else None
             if not replay_title:
@@ -993,46 +1225,60 @@ def main(argv: list[str] | None = None) -> int:
                 )
             default_name = safe_filename(f"{course_name or course_id}_{replay_title}") + ".mp4"
             debug("Media Cookie available:", "yes (value hidden)" if media_cookie else "no")
-            probe_and_optionally_download(session, media_url, media_cookie, default_name)
+            probe_and_optionally_download(session, media_candidates, media_cookie, default_name)
     print("Done. No password, token, or cookie value was printed.")
     return 0
 
 
 def probe_and_optionally_download(
-    session: requests.Session, media_url: str, media_cookie: str,
-    default_name: str = "replay.mp4", duration: float = 0.0,
+    session: requests.Session, candidates: list[dict], media_cookie: str,
+    default_name: str = "replay.mp4",
 ) -> None:
-    if not media_url:
+    if not candidates:
         print("No media URL returned.")
         return
-    debug("== 8. HLS probe/download ==")
-    response = request(
-        session,
-        "GET",
-        media_url,
-        headers={"Cookie": f"_token={media_cookie}"},
-    )
-    debug("Playlist HTTP:", response.status_code, response.reason)
-    debug("Playlist Content-Type:", response.headers.get("Content-Type", ""))
-    if response.ok:
-        lines = [line.strip() for line in response.text.splitlines() if line.strip()]
-        duration = duration or playlist_duration(response.text)
-        debug("Playlist lines:", len(lines), "segment/child references:", sum(not line.startswith("#") for line in lines))
-        tags = [line for line in lines if line.startswith("#")][:8]
-        debug("Playlist first tags:", " | ".join(tags))
-    else:
-        print("Playlist request failed; download skipped.")
+    debug("== 8. Media probe/download ==")
+    headers = {"Cookie": f"_token={media_cookie}"}
+    media = None
+    for candidate in candidates:
+        parsed = urlsplit(candidate["url"])
+        debug(f"Probing {candidate['kind']} candidate: {parsed.netloc}{parsed.path}")
+        media = probe_media(session, candidate, headers)
+        if media:
+            break
+    if not media:
+        print("No usable media URL was returned; download skipped.")
         return
+    if media["kind"] == "hls":
+        print(
+            f"Found HLS replay: {media['label']}, "
+            f"duration {format_time(media['duration'])}"
+        )
+    else:
+        size = f" {format_bytes(media['size'])}" if media["size"] else ""
+        print(f"Found direct media: {media['label']} ({media['content_type']}{size})")
     answer = input("Download/resume this replay? [y/N]: ").strip().lower()
     if answer != "y":
         return
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        print("ffmpeg not found in PATH.")
-        return
     output = input(f"Output file [{default_name}]: ").strip() or default_name
     output_path = Path(output).expanduser()
-    resumable_hls_download(session, media_url, media_cookie, output_path, ffmpeg)
+    try:
+        if media["kind"] == "hls":
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                print("ffmpeg not found in PATH; HLS download requires it.")
+                return
+            resumable_hls_download(
+                session, media["playlist_url"], media_cookie, output_path, ffmpeg,
+                (media["playlist_url"], media["body"]),
+            )
+        else:
+            resumable_file_download(
+                session, media["url"], media_cookie, output_path, media["size"],
+            )
+    except Exception as exc:
+        print(f"Download failed: {type(exc).__name__}; partial data was kept for resume.")
+        debug(describe_exception(exc))
 
 
 if __name__ == "__main__":
