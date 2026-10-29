@@ -5,6 +5,7 @@ description = "Download PKU Haoxue classroom replays"
 requires-python = ">=3.10"
 dependencies = [
     "pycryptodome>=3.20,<4",
+    "cryptography>=44,<47",
     "requests>=2.31,<3",
 ]
 

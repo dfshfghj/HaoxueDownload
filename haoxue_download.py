@@ -9,11 +9,16 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import os
+import platform
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
@@ -22,6 +27,9 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/135 Sa
 PASSPORT = "https://passport.pku.edu.cn"
 IAAA = "https://iaaa.pku.edu.cn/iaaa"
 VERBOSE = False
+AUTH_DIRECTORY_NAME = "HaoxueDownload"
+COOKIE_FILENAME = "cookies.enc"
+KEY_FILENAME = "cookies.key"
 
 
 def debug(*args, **kwargs) -> None:
@@ -116,6 +124,129 @@ def request(session: requests.Session, method: str, url: str, **kwargs) -> reque
     return session.request(method, url, timeout=30, allow_redirects=False, **kwargs)
 
 
+def _absolute_env_path(name: str) -> Path | None:
+    """Read a platform directory variable only when it is a valid absolute path."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    candidate = Path(value).expanduser()
+    return candidate if candidate.is_absolute() else None
+
+
+def auth_directory() -> Path:
+    """Return the platform-standard per-user data directory.
+
+    The location is deliberately independent of the repository and current
+    working directory. Environment variables are accepted only when absolute,
+    as required by the relevant platform conventions.
+    """
+    home = Path.home()
+    system = platform.system()
+    if system == "Windows":
+        root = _absolute_env_path("LOCALAPPDATA") or (home / "AppData" / "Local")
+    elif system == "Darwin":
+        root = home / "Library" / "Application Support"
+    else:
+        root = _absolute_env_path("XDG_DATA_HOME") or (home / ".local" / "share")
+    return (root / AUTH_DIRECTORY_NAME).resolve()
+
+
+def restrict_file(path: Path) -> None:
+    """Restrict files/directories on POSIX; Windows uses the profile ACL."""
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def prepare_auth_directory() -> Path:
+    directory = auth_directory()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        directory.chmod(0o700)
+    if not directory.is_dir():
+        raise OSError(f"authentication path is not a directory: {directory}")
+    return directory
+
+
+def auth_paths() -> tuple[Path, Path]:
+    directory = auth_directory()
+    return directory / COOKIE_FILENAME, directory / KEY_FILENAME
+
+
+def save_login_cookies(session: requests.Session) -> bool:
+    """Store encrypted session cookies in the per-user data directory."""
+    try:
+        cookies = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "expires": cookie.expires,
+                "secure": cookie.secure,
+            }
+            for cookie in session.cookies
+        ]
+        cookie_path, key_path = auth_paths()
+        prepare_auth_directory()
+        if not key_path.exists():
+            key_path.write_bytes(Fernet.generate_key())
+            restrict_file(key_path)
+        key = key_path.read_bytes()
+        encrypted = Fernet(key).encrypt(json.dumps(cookies, separators=(",", ":")).encode())
+        temporary = cookie_path.with_name(cookie_path.name + ".tmp")
+        temporary.write_bytes(encrypted)
+        restrict_file(temporary)
+        temporary.replace(cookie_path)
+        restrict_file(cookie_path)
+        return True
+    except Exception as exc:
+        debug("Could not save encrypted login state:", type(exc).__name__, str(exc)[:160])
+        return False
+
+
+def load_login_cookies(session: requests.Session) -> bool:
+    """Restore encrypted session cookies from the per-user data directory."""
+    try:
+        cookie_path, key_path = auth_paths()
+        if not cookie_path.is_file() or not key_path.is_file():
+            return False
+        records = json.loads(Fernet(key_path.read_bytes()).decrypt(cookie_path.read_bytes()).decode())
+        if not isinstance(records, list):
+            return False
+        for record in records:
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            cookie_kwargs = {
+                "path": str(record.get("path", "/")),
+                "expires": record.get("expires"),
+                "secure": bool(record.get("secure", False)),
+            }
+            if record.get("domain"):
+                cookie_kwargs["domain"] = str(record["domain"])
+            session.cookies.set(
+                str(record["name"]), str(record.get("value", "")), **cookie_kwargs
+            )
+        return bool(session.cookies)
+    except (InvalidToken, OSError, ValueError, TypeError) as exc:
+        debug("Could not load encrypted login state:", type(exc).__name__)
+        return False
+
+
+def saved_login_is_valid(session: requests.Session) -> bool:
+    """Validate a restored cookie jar against the authenticated course API."""
+    api_token = next((c.value for c in session.cookies if c.name == "_token2"), "")
+    if not api_token:
+        return False
+    response = course_api(session, "v3/course/get-use-member", {"page": "1"}, api_token)
+    if not response.ok:
+        return False
+    try:
+        value = response.json()
+    except ValueError:
+        return False
+    return isinstance(value, dict) and value.get("success") is not False
+
+
 def api_sign(params: dict[str, str]) -> str:
     material = "".join(key + params[key] for key in sorted(params))
     return hashlib.md5((material + "8225ca5fa4d56d6fde540db6024fba39").encode()).hexdigest()
@@ -165,62 +296,270 @@ def print_course_records(data) -> None:
         )
 
 
-def print_sub_records(data) -> None:
+def select_record_value(records: list, prompt: str, id_key: str) -> str:
+    """Accept either the displayed 1-based index or the record's existing ID."""
+    if not isinstance(records, list):
+        print(f"No selectable records for {id_key}.")
+        return ""
+    choice = input(prompt).strip()
+    if not choice:
+        return ""
+    # Prefer an exact ID match so numeric IDs are not mistaken for list indexes.
+    for item in records:
+        if isinstance(item, dict) and str(item.get(id_key, "")).strip() == choice:
+            return choice
+    try:
+        index = int(choice)
+    except ValueError:
+        index = 0
+    if 1 <= index <= len(records) and isinstance(records[index - 1], dict):
+        value = records[index - 1].get(id_key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    print(f"No matching {id_key}: {choice}")
+    return ""
+
+
+def print_sub_records(data, hidden_subjects: list | None = None) -> None:
     # get-course-detail maps to PlaybackVideoListBean.Data, whose subject
     # collection is named sub_list (the course-list endpoint uses lists).
     if isinstance(data, dict) and isinstance(data.get("data"), dict):
         data = data["data"]
     records = data.get("sub_list", []) if isinstance(data, dict) else []
-    print(f"Subject records: {len(records)}")
-    for index, item in enumerate(records, 1):
+    all_records = list(records) + (hidden_subjects or [])
+    hidden_count = len(hidden_subjects) if hidden_subjects else 0
+    print(f"Subject records: {len(records)} (+{hidden_count} hidden)")
+    for index, item in enumerate(all_records, 1):
         if not isinstance(item, dict):
             continue
+        hidden_tag = " [hidden]" if item.get("_hidden") else ""
+        vid_tag = f" videos={item.get('_video_count', 0)}" if item.get("_video_count") else ""
         print(
             f"  [{index}] sub_id={item.get('id')}, title={item.get('sub_title')}, "
             f"status={item.get('sub_status')}, begin={item.get('class_begin')}, "
             f"over={item.get('class_over')}, playback_status={item.get('playback_status')}"
+            f"{vid_tag}{hidden_tag}"
         )
     if not records and isinstance(data, dict):
         print("Subject response keys:", ", ".join(sorted(data)))
 
 
-def print_video_info(data) -> str:
+def classify_media_url(url: str) -> str:
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    if suffix == ".m3u8":
+        return "hls"
+    if suffix in {".mp4", ".m4v", ".mov", ".mkv", ".flv", ".webm", ".ts"}:
+        return "file"
+    return "unknown"
+
+
+def _http_url(value) -> str:
+    text = unescape(str(value or "")).strip()
+    return text if text.startswith(("http://", "https://")) else ""
+
+
+def extract_media_candidates(data) -> list[dict]:
+    """Collect every media URL the sub-detail response exposes.
+
+    Processed replays are usually HLS, while freshly published ones can be a
+    plain MP4 served from httpDownload.  Keep the API's order and de-duplicate
+    by host/path so an expiring query string cannot create duplicates.
+    """
     if not isinstance(data, dict):
         debug("Video info data shape:", response_shape(json.dumps(data)))
-        return ""
+        return []
     video_data = data.get("data", data)
     if not isinstance(video_data, dict):
         debug("Video info data shape:", response_shape(json.dumps(video_data)))
-        return ""
+        return []
     debug("Video info keys:", ", ".join(sorted(video_data)))
+    raw: list[tuple[str, str, int]] = []
     choices = video_data.get("videoArr") or []
-    media_url = ""
-    debug(f"Video choices: {len(choices)}")
-    for item in choices:
-        if not isinstance(item, dict):
-            continue
-        raw_url = str(item.get("path", ""))
-        if not media_url and raw_url:
-            media_url = raw_url
-        parsed = urlsplit(raw_url)
-        debug(
-            f"  tag={item.get('tag')}, select={item.get('select')}, "
-            f"file_size={item.get('file_size')}, scheme={parsed.scheme}, "
-            f"host={parsed.netloc}, path={parsed.path}, query_keys="
-            f"{','.join(sorted({part.split('=', 1)[0] for part in parsed.query.split('&') if part}))}"
-        )
+    debug(f"Video choices: {len(choices) if isinstance(choices, list) else 0}")
+    if isinstance(choices, list):
+        for item in choices:
+            if not isinstance(item, dict):
+                continue
+            url = _http_url(item.get("path"))
+            if not url:
+                continue
+            try:
+                size = int(item.get("file_size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            parsed = urlsplit(url)
+            debug(
+                f"  tag={item.get('tag')}, size={size}, host={parsed.netloc}, "
+                f"path={parsed.path}, query_keys="
+                f"{','.join(sorted({part.split('=', 1)[0] for part in parsed.query.split('&') if part}))}"
+            )
+            raw.append((url, str(item.get("tag") or "video"), size))
     sub_content = video_data.get("sub_content") or {}
     if isinstance(sub_content, dict):
         saved = sub_content.get("save_playback") or {}
-        if isinstance(saved, dict) and saved.get("contents"):
-            parsed = urlsplit(str(saved["contents"]))
-            debug(
-                "Fallback save_playback.contents: "
-                f"scheme={parsed.scheme}, host={parsed.netloc}, path={parsed.path}"
-            )
-            if not media_url:
-                media_url = str(saved["contents"])
-    return media_url
+        if isinstance(saved, dict):
+            raw.append((_http_url(saved.get("contents")), "saved playback", 0))
+        playback = sub_content.get("playback") or {}
+        if isinstance(playback, dict):
+            raw.append((_http_url(playback.get("url")), "playback", 0))
+        files = sub_content.get("file_list") or []
+        if isinstance(files, list):
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                url = _http_url(item.get("file_name"))
+                if url and classify_media_url(url) == "file":
+                    raw.append((url, str(item.get("file_type") or "file"), 0))
+        firm = sub_content.get("firm_source") or {}
+        if isinstance(firm, dict):
+            raw.append((_http_url(firm.get("contents")), "cloud source", 0))
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for url, label, size in raw:
+        if not url:
+            continue
+        absolute = urlsplit(url)
+        identity = urlunsplit((absolute.scheme, absolute.netloc, absolute.path, "", ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidates.append({
+            "url": url,
+            "label": label,
+            "size": size,
+            "kind": classify_media_url(url),
+        })
+    return candidates
+
+
+def _time_slot_key(title: str) -> str:
+    m = re.search(r"第\d+-\d+节", title or "")
+    return m.group(0) if m else ""
+
+
+def _detect_global_step(visible_subjects: list[dict]) -> int:
+    groups: dict[str, list[int]] = {}
+    for s in visible_subjects:
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        if sid <= 0:
+            continue
+        key = _time_slot_key(s.get("sub_title", "") or s.get("title", ""))
+        if key:
+            groups.setdefault(key, []).append(sid)
+    for ids in groups.values():
+        if len(ids) >= 2:
+            ids_sorted = sorted(ids)
+            diffs = [b - a for a, b in zip(ids_sorted, ids_sorted[1:]) if b > a]
+            if diffs:
+                diffs.sort()
+                return diffs[len(diffs) // 2]
+    return 4
+
+
+def scan_hidden_subjects(
+    session: requests.Session, course_id: str, visible_subjects: list[dict], api_token: str,
+) -> list[dict]:
+    """Find subjects hidden by playback_status filtering via sub_id enumeration."""
+    step = _detect_global_step(visible_subjects)
+    groups: dict[str, list[int]] = {}
+    visible_ids: set[int] = set()
+    for s in visible_subjects:
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        if sid <= 0:
+            continue
+        visible_ids.add(sid)
+        key = _time_slot_key(s.get("sub_title", "") or s.get("title", ""))
+        groups.setdefault(key or "_unknown", []).append(sid)
+    if not groups:
+        return []
+
+    scan_starts = []
+    for slot, ids in groups.items():
+        ids.sort()
+        scan_starts.append((slot, ids[0]))
+    scan_starts.sort(key=lambda t: t[1])
+
+    debug(f"Hidden scan: global_step={step} scan_starts={scan_starts}")
+    hidden: list[dict] = []
+    seen: set[int] = set(visible_ids)
+
+    for slot, group_min in scan_starts:
+        misses = 0
+        for probe_id in range(group_min - step, max(group_min - 200, 0), -step):
+            if probe_id <= 0 or probe_id in seen:
+                continue
+            try:
+                r = course_api(
+                    session, "v3/course/get-course-sub-detail",
+                    {"course_id": course_id, "sub_id": str(probe_id)}, api_token,
+                )
+                d = r.json()
+                if not d.get("success"):
+                    misses += 1
+                    if misses >= 5:
+                        break
+                    continue
+                vd = d.get("data", d) if isinstance(d, dict) else d
+                if not isinstance(vd, dict):
+                    misses += 1
+                    continue
+                if str(vd.get("course_id", "")) != str(course_id):
+                    misses += 1
+                    continue
+                misses = 0
+                seen.add(probe_id)
+                va = vd.get("videoArr", [])
+                if not isinstance(va, list):
+                    va = []
+                pb = 0
+                sc = vd.get("sub_content")
+                if isinstance(sc, dict):
+                    pb = sc.get("playback_status", 0) or 0
+                hidden.append({
+                    "id": str(probe_id),
+                    "p_id": "0",
+                    "sub_title": vd.get("title", ""),
+                    "type": "course_live",
+                    "class_begin": "",
+                    "class_over": "",
+                    "sub_status": "6" if len(va) > 0 else "2",
+                    "click_record_num": "0",
+                    "lecturer": "",
+                    "lecturer_name": "",
+                    "is_open": "",
+                    "is_share": "",
+                    "is_export": "",
+                    "show": "yes",
+                    "is_public": "",
+                    "sub_delete": "0",
+                    "sub_review_type": "",
+                    "sub_data_id": "",
+                    "playback_status": str(pb),
+                    "olive_type": "",
+                    "precondition_time": "",
+                    "finished": 0,
+                    "_hidden": True,
+                    "_video_count": len(va),
+                })
+                debug(f"  Hidden: sub_id={probe_id} title={vd.get('title')} videos={len(va)}")
+            except Exception as e:
+                debug(f"  Probe error for {probe_id}:", e)
+                misses += 1
+            time.sleep(0.15)
+
+    hidden.sort(key=lambda s: int(s.get("id", 0)))
+    return hidden
 
 
 def safe_filename(value: str) -> str:
@@ -237,26 +576,439 @@ def format_time(seconds: float) -> str:
     return f"{seconds // 3600:02}:{seconds % 3600 // 60:02}:{seconds % 60:02}"
 
 
+def describe_exception(exc: Exception) -> str:
+    """Describe an error without echoing URLs that may carry access tokens."""
+    status = getattr(getattr(exc, "response", None), "status_code", "")
+    return f"{type(exc).__name__}{f' HTTP {status}' if status else ''}"
+
+
+def format_bytes(value: float) -> str:
+    value = max(0.0, float(value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
 def run_ffmpeg_with_progress(command: list[str], duration: float) -> int:
     command = [*command[: command.index("-i")], "-progress", "pipe:1", "-nostats", *command[command.index("-i"):]]
     stderr = None if VERBOSE else subprocess.DEVNULL
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1)
     current = 0.0
+    started_at = time.monotonic()
     if process.stdout:
         for line in process.stdout:
             key, _, value = line.strip().partition("=")
             if key == "out_time_ms":
                 current = int(value or 0) / 1_000_000
+                elapsed = time.monotonic() - started_at
                 if duration > 0:
                     ratio = min(current / duration, 1.0)
                     width = 32
                     bar = "#" * int(width * ratio) + "-" * (width - int(width * ratio))
-                    print(f"\rffmpeg [{bar}] {ratio * 100:5.1f}% {format_time(current)}/{format_time(duration)}", end="", flush=True)
+                    eta = elapsed * (duration / current - 1) if current > 0 else 0
+                    print(
+                        f"\rffmpeg [{bar}] {ratio * 100:5.1f}% "
+                        f"processed {format_time(current)}/{format_time(duration)} "
+                        f"elapsed {format_time(elapsed)} ETA {format_time(eta)}",
+                        end="", flush=True,
+                    )
                 else:
-                    print(f"\rffmpeg {format_time(current)}", end="", flush=True)
+                    print(
+                        f"\rffmpeg processed {format_time(current)} "
+                        f"elapsed {format_time(elapsed)}",
+                        end="", flush=True,
+                    )
     code = process.wait()
     print()
     return code
+
+
+def playlist_identity(body: str, playlist_url: str) -> str:
+    """Return an identity that survives changes to expiring URL query strings."""
+    normalized: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: 'URI="' + urlunsplit(
+                    (*urlsplit(urljoin(playlist_url, match.group(1)))[:3], "", "")
+                ) + '"',
+                line,
+            )
+            normalized.append(line)
+            continue
+        absolute = urlsplit(urljoin(playlist_url, line))
+        normalized.append(urlunsplit((absolute.scheme, absolute.netloc, absolute.path, "", "")))
+    return hashlib.sha256("\n".join(normalized).encode()).hexdigest()
+
+
+def fetch_media_playlist(
+    session: requests.Session, playlist_url: str, headers: dict[str, str], depth: int = 0,
+) -> tuple[str, str]:
+    """Resolve a master playlist to its highest-bandwidth media playlist."""
+    if depth > 5:
+        raise RuntimeError("HLS playlist nesting is too deep")
+    response = session.get(
+        playlist_url, headers={"User-Agent": UA, **headers}, timeout=30,
+        allow_redirects=True, stream=True,
+    )
+    try:
+        response.raise_for_status()
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=256 * 1024):
+            if chunk:
+                content.extend(chunk)
+                if len(content) > 16 * 1024 * 1024:
+                    raise RuntimeError("HLS playlist exceeds 16 MiB; refusing unsafe response")
+        body = bytes(content).decode(response.encoding or "utf-8", errors="replace")
+    finally:
+        response.close()
+    if "#EXTM3U" not in body[:4096]:
+        raise RuntimeError("media URL did not return an HLS playlist")
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    variants: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        match = re.search(r"(?:^|,)BANDWIDTH=(\d+)", line)
+        bandwidth = int(match.group(1)) if match else 0
+        if index + 1 < len(lines) and not lines[index + 1].startswith("#"):
+            variants.append((bandwidth, urljoin(response.url, lines[index + 1])))
+    if variants:
+        _, selected_url = max(variants, key=lambda item: item[0])
+        debug(f"Selected HLS variant from {len(variants)} choices")
+        return fetch_media_playlist(session, selected_url, headers, depth + 1)
+    return response.url, body
+
+
+def download_cached_resource(
+    session: requests.Session, url: str, destination: Path, headers: dict[str, str],
+) -> bool:
+    """Download one resource atomically. Return False when it was cached."""
+    if destination.is_file() and destination.stat().st_size > 0:
+        return False
+    temporary = destination.with_name(destination.name + ".part")
+    try:
+        with session.get(
+            url, headers={"User-Agent": UA, **headers}, timeout=30,
+            allow_redirects=True, stream=True,
+        ) as response:
+            response.raise_for_status()
+            expected = int(response.headers.get("Content-Length", "0") or 0)
+            written = 0
+            with temporary.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        output.write(chunk)
+                        written += len(chunk)
+        if written == 0 or (expected and written != expected):
+            raise IOError(f"incomplete response: expected {expected}, received {written}")
+        temporary.replace(destination)
+        return True
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def cache_hls_playlist(
+    session: requests.Session, playlist_url: str, body: str, cache_dir: Path,
+    headers: dict[str, str],
+) -> tuple[Path, int, int]:
+    """Cache HLS resources and write a playlist that refers only to local files."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    identity_file = cache_dir / "playlist.sha256"
+    identity = playlist_identity(body, playlist_url)
+    if identity_file.exists() and identity_file.read_text(encoding="ascii").strip() != identity:
+        raise RuntimeError(
+            f"playlist differs from the cache in {cache_dir}; choose another output "
+            "name or remove that cache directory"
+        )
+
+    identity_file.write_text(identity + "\n", encoding="ascii")
+
+    lines = body.splitlines()
+    segment_urls = []
+    segment_durations = []
+    pending_duration = 0.0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#EXTINF:"):
+            match = re.match(r"#EXTINF:([0-9]+(?:\.[0-9]+)?)", stripped)
+            pending_duration = float(match.group(1)) if match else 0.0
+        elif stripped and not stripped.startswith("#"):
+            segment_urls.append(urljoin(playlist_url, stripped))
+            segment_durations.append(pending_duration)
+            pending_duration = 0.0
+    total = len(segment_urls)
+    if not total:
+        raise RuntimeError("media playlist contains no segments")
+
+    local_lines: list[str] = []
+    downloaded = 0
+    ready_duration = 0.0
+    total_duration = sum(segment_durations)
+    started_at = time.monotonic()
+    segment_index = 0
+    auxiliary_names: dict[str, str] = {}
+    segment_names: dict[str, str] = {}
+
+    def cache_auxiliary(remote_url: str, kind: str) -> str:
+        nonlocal downloaded
+        absolute_url = urljoin(playlist_url, remote_url)
+        if absolute_url not in auxiliary_names:
+            suffix = Path(urlsplit(absolute_url).path).suffix or ".bin"
+            name = f"{kind}_{len(auxiliary_names) + 1:03d}{suffix}"
+            if download_cached_resource(session, absolute_url, cache_dir / name, headers):
+                downloaded += 1
+            auxiliary_names[absolute_url] = name
+        return auxiliary_names[absolute_url]
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-KEY:") and 'URI="' in line:
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: f'URI="{cache_auxiliary(match.group(1), "key")}"',
+                line,
+            )
+        elif line.startswith("#EXT-X-MAP:") and 'URI="' in line:
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: f'URI="{cache_auxiliary(match.group(1), "init")}"',
+                line,
+            )
+        elif not line.startswith("#"):
+            segment_index += 1
+            remote_url = urljoin(playlist_url, line)
+            local_name = segment_names.get(remote_url)
+            was_downloaded = False
+            if local_name is None:
+                suffix = Path(urlsplit(remote_url).path).suffix or ".ts"
+                local_name = f"segment_{segment_index:06d}{suffix}"
+                segment_names[remote_url] = local_name
+                was_downloaded = download_cached_resource(
+                    session, remote_url, cache_dir / local_name, headers,
+                )
+            if was_downloaded:
+                downloaded += 1
+            ready_duration += segment_durations[segment_index - 1]
+            state = "downloaded" if was_downloaded else "cached"
+            elapsed = time.monotonic() - started_at
+            eta = (
+                elapsed * (total_duration / ready_duration - 1)
+                if ready_duration > 0 else 0
+            )
+            print(
+                f"\rSegments: {segment_index}/{total} ({state}) "
+                f"ready {format_time(ready_duration)}/{format_time(total_duration)} "
+                f"elapsed {format_time(elapsed)} ETA {format_time(eta)}",
+                end="", flush=True,
+            )
+            line = local_name
+        local_lines.append(line)
+    print()
+
+    local_playlist = cache_dir / "local.m3u8"
+    local_playlist.write_text("\n".join(local_lines) + "\n", encoding="utf-8")
+    return local_playlist, downloaded, total
+
+
+def resumable_hls_download(
+    session: requests.Session, media_url: str, media_cookie: str,
+    output_path: Path, ffmpeg: str,
+    playlist: tuple[str, str] | None = None,
+) -> None:
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_dir = output_path.parent / f"{output_path.name}.segments"
+    headers = {"Cookie": f"_token={media_cookie}"}
+    if playlist is None:
+        playlist_url, body = fetch_media_playlist(session, media_url, headers)
+    else:
+        playlist_url, body = playlist
+    duration = playlist_duration(body)
+    local_playlist, downloaded, total = cache_hls_playlist(
+        session, playlist_url, body, cache_dir, headers,
+    )
+    print(f"Segments ready: {total}; downloaded now: {downloaded}; cache: {cache_dir}")
+
+    temporary_output = output_path.with_name(
+        output_path.stem + ".part" + (output_path.suffix or ".mp4")
+    )
+    command = [
+        ffmpeg, "-hide_banner", "-y", "-protocol_whitelist", "file,crypto,data",
+        "-allowed_extensions", "ALL",
+        "-i", str(local_playlist), "-c", "copy", str(temporary_output),
+    ]
+    print("Joining cached segments with ffmpeg.")
+    result_code = run_ffmpeg_with_progress(command, duration)
+    print("ffmpeg exit code:", result_code)
+    if result_code != 0:
+        temporary_output.unlink(missing_ok=True)
+        print("Join failed; cached segments were kept for the next run.")
+        return
+    temporary_output.replace(output_path)
+    shutil.rmtree(cache_dir)
+    print("Saved:", output_path)
+    print("Segment cache removed.")
+
+
+def resumable_file_download(
+    session: requests.Session, media_url: str, media_cookie: str,
+    output_path: Path, expected_size: int = 0,
+) -> None:
+    """Download a plain media file with HTTP Range resume support."""
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        output_path.stem + ".part" + (output_path.suffix or ".mp4")
+    )
+    offset = temporary.stat().st_size if temporary.is_file() else 0
+    headers = {"User-Agent": UA, "Cookie": f"_token={media_cookie}"}
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+
+    with session.get(
+        media_url, headers=headers, timeout=60, allow_redirects=True, stream=True,
+    ) as response:
+        if response.status_code == 416 and offset:
+            match = re.search(r"/(\d+)\s*$", response.headers.get("Content-Range", ""))
+            total = int(match.group(1)) if match else expected_size
+            if total and offset >= total:
+                temporary.replace(output_path)
+                print("Already complete; saved:", output_path)
+                return
+        response.raise_for_status()
+        if response.status_code == 206:
+            match = re.search(r"/(\d+)\s*$", response.headers.get("Content-Range", ""))
+            if match:
+                total = int(match.group(1))
+            else:
+                length = int(response.headers.get("Content-Length", "0") or 0)
+                total = offset + length if length else 0
+            mode = "ab"
+        else:
+            if offset:
+                print("Server ignored the resume request; restarting from zero.")
+                offset = 0
+            total = int(response.headers.get("Content-Length", "0") or 0) or expected_size
+            mode = "wb"
+        total = total or expected_size
+        print(
+            f"Starting direct download"
+            f"{f' (resuming at {format_bytes(offset)})' if offset else ''}; "
+            "URL and cookie are hidden."
+        )
+        written = offset
+        started_at = time.monotonic()
+        with temporary.open(mode) as output:
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                output.write(chunk)
+                written += len(chunk)
+                elapsed = max(time.monotonic() - started_at, 1e-6)
+                if total > 0:
+                    ratio = min(written / total, 1.0)
+                    width = 32
+                    bar = "#" * int(width * ratio) + "-" * (width - int(width * ratio))
+                    speed = (written - offset) / elapsed
+                    eta = (total - written) / speed if speed > 0 else 0
+                    print(
+                        f"\rDownload [{bar}] {ratio * 100:5.1f}% "
+                        f"{format_bytes(written)}/{format_bytes(total)} "
+                        f"elapsed {format_time(elapsed)} ETA {format_time(eta)}",
+                        end="", flush=True,
+                    )
+                else:
+                    print(
+                        f"\rDownload {format_bytes(written)} "
+                        f"elapsed {format_time(elapsed)}",
+                        end="", flush=True,
+                    )
+    print()
+    final_size = temporary.stat().st_size
+    if total and final_size != total:
+        raise IOError(f"incomplete download: expected {total} bytes, received {final_size}")
+    temporary.replace(output_path)
+    print("Saved:", output_path)
+
+
+def read_media_prefix(
+    session: requests.Session, url: str, headers: dict[str, str], limit: int = 64 * 1024,
+) -> tuple[str, bytes, int, str]:
+    """Read a small response prefix without pulling a whole media file."""
+    response = session.get(
+        url, headers={"User-Agent": UA, **headers}, timeout=30,
+        allow_redirects=True, stream=True,
+    )
+    try:
+        response.raise_for_status()
+        prefix = bytearray()
+        for chunk in response.iter_content(chunk_size=8 * 1024):
+            if chunk:
+                prefix.extend(chunk)
+                if len(prefix) >= limit:
+                    break
+        raw_length = response.headers.get("Content-Length", "")
+        length = int(raw_length) if raw_length.isdigit() else 0
+        return response.url, bytes(prefix), length, response.headers.get("Content-Type", "")
+    finally:
+        response.close()
+
+
+def probe_media(
+    session: requests.Session, candidate: dict, headers: dict[str, str],
+) -> dict | None:
+    """Return download details for one candidate URL, or None when unusable."""
+    url = candidate["url"]
+    if candidate["kind"] == "hls":
+        try:
+            playlist_url, body = fetch_media_playlist(session, url, headers)
+        except Exception as exc:
+            debug(f"HLS probe failed ({describe_exception(exc)})")
+            return None
+        return {
+            **candidate,
+            "kind": "hls",
+            "playlist_url": playlist_url,
+            "body": body,
+            "duration": playlist_duration(body),
+        }
+    try:
+        _, prefix, length, content_type = read_media_prefix(session, url, headers)
+    except Exception as exc:
+        debug(f"Media probe failed ({describe_exception(exc)})")
+        return None
+    if not prefix:
+        debug("Media probe returned an empty response")
+        return None
+    if b"#EXTM3U" in prefix[:4096]:
+        try:
+            playlist_url, body = fetch_media_playlist(session, url, headers)
+        except Exception as exc:
+            debug(f"HLS probe failed ({describe_exception(exc)})")
+            return None
+        return {
+            **candidate,
+            "kind": "hls",
+            "playlist_url": playlist_url,
+            "body": body,
+            "duration": playlist_duration(body),
+        }
+    return {
+        **candidate,
+        "kind": "file",
+        "content_type": content_type or "unknown type",
+        "size": candidate["size"] or length,
+    }
 
 
 def fetch_all_courses(session: requests.Session, search: str, api_token: str) -> list[dict]:
@@ -312,6 +1064,15 @@ def main(argv: list[str] | None = None) -> int:
     VERBOSE = args.verbose
     session = requests.Session()
 
+    restore = input("Use the last saved login session? [Y/n]: ").strip().lower()
+    restored = restore not in {"n", "no"}
+    if restored:
+        restored = load_login_cookies(session) and saved_login_is_valid(session)
+        if restored:
+            print("Restored the saved login session.")
+        else:
+            print("No valid saved login session; starting a new login.")
+
     debug("== 1. Passport entry ==")
     response = request(
         session,
@@ -341,46 +1102,52 @@ def main(argv: list[str] | None = None) -> int:
     key_data = response.json()
     public_key = RSA.import_key(key_data["key"])
 
-    account = input("Account: ")
-    password = getpass.getpass("Password: ")
-    encrypted = PKCS1_v1_5.new(public_key).encrypt(password.encode("utf-8"))
-    password = ""
+    if not restored:
+        account = input("Account: ")
+        password = getpass.getpass("Password: ")
+        encrypted = PKCS1_v1_5.new(public_key).encrypt(password.encode("utf-8"))
+        password = ""
 
-    debug("== 4. IAAA login (credentials are not printed) ==")
-    login_form = {
-        "appid": appid,
-        "userName": account,
-        "password": base64.b64encode(encrypted).decode("ascii"),
-        "randCode": "",
-        "smsCode": "",
-        "otpCode": "",
-        "remTrustChk": "false",
-        "redirUrl": oauth_form["redirectUrl"],
-    }
-    response = request(session, "POST", IAAA + "/oauthlogin.do", data=login_form)
-    body = response.text
-    show_response(response, body)
-    result = response.json()
-    if not result.get("success"):
-        print("Login did not succeed. Paste this output only.")
-        return 2
+    if not restored:
+        debug("== 4. IAAA login (credentials are not printed) ==")
+        login_form = {
+            "appid": appid,
+            "userName": account,
+            "password": base64.b64encode(encrypted).decode("ascii"),
+            "randCode": "",
+            "smsCode": "",
+            "otpCode": "",
+            "remTrustChk": "false",
+            "redirUrl": oauth_form["redirectUrl"],
+        }
+        response = request(session, "POST", IAAA + "/oauthlogin.do", data=login_form)
+        body = response.text
+        show_response(response, body)
+        result = response.json()
+        if not result.get("success"):
+            print("Login did not succeed. Paste this output only.")
+            return 2
 
-    token = str(result.get("token", ""))
-    debug(f"IAAA token received: yes (length {len(token)}, value hidden)")
+        token = str(result.get("token", ""))
+        debug(f"IAAA token received: yes (length {len(token)}, value hidden)")
 
-    callback = PASSPORT + "/?_rand=debug&token=" + quote(token, safe="")
-    debug("== 5. Passport token callback ==")
-    response = request(session, "GET", callback)
-    callback_body = response.text
-    show_response(response, callback_body)
-    debug("Callback contains PKULoginSuccess:", "PKULoginSuccess" in callback_body)
-    debug("Final session cookie metadata:")
-    for cookie in sorted(session.cookies, key=lambda c: c.name):
+        callback = PASSPORT + "/?_rand=debug&token=" + quote(token, safe="")
+        debug("== 5. Passport token callback ==")
+        response = request(session, "GET", callback)
+        callback_body = response.text
+        show_response(response, callback_body)
+        debug("Callback contains PKULoginSuccess:", "PKULoginSuccess" in callback_body)
+        debug("Final session cookie metadata:")
+        for cookie in sorted(session.cookies, key=lambda c: c.name):
             debug(
-            f"  {cookie.name}: length={len(cookie.value)}, "
-            f"domain={cookie.domain}, path={cookie.path}, secure={cookie.secure}"
-        )
-    show_callback_clues(callback_body)
+                f"  {cookie.name}: length={len(cookie.value)}, "
+                f"domain={cookie.domain}, path={cookie.path}, secure={cookie.secure}"
+            )
+        show_callback_clues(callback_body)
+        if save_login_cookies(session):
+            print(f"Encrypted login state saved locally: {auth_directory()}")
+        else:
+            print("Could not save encrypted login state; login state was not saved.")
     debug("== 6. Authenticated course API probe ==")
     api_params = {
         "page": "1",
@@ -409,7 +1176,11 @@ def main(argv: list[str] | None = None) -> int:
     search = input("Course search (empty for all): ")
     course_records = fetch_all_courses(session, search, api_token)
     print_course_records({"lists": course_records})
-    course_id = input("course_id to inspect (empty to stop): ").strip()
+    course_id = select_record_value(
+        course_records,
+        "Course number or course_id to inspect (empty to stop): ",
+        "course_id",
+    )
     if course_id:
         response = course_api(
             session,
@@ -419,8 +1190,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         show_response(response, response.text)
         subject_data = json_data(response)
-        print_sub_records(subject_data)
-        subject_id = input("sub_id to inspect (empty to stop): ").strip()
+        subject_container = subject_data
+        if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
+            subject_container = subject_container["data"]
+        subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
+        if not isinstance(subjects, list):
+            subjects = []
+        print("Scanning for hidden recordings...")
+        hidden_subjects = scan_hidden_subjects(session, course_id, subjects, api_token)
+        print_sub_records(subject_data, hidden_subjects)
+        all_subjects = subjects + hidden_subjects
+        subject_id = select_record_value(
+            all_subjects,
+            "Lesson number or sub_id to inspect (empty to stop): ",
+            "id",
+        )
         if subject_id:
             response = course_api(
                 session,
@@ -430,66 +1214,71 @@ def main(argv: list[str] | None = None) -> int:
             )
             show_response(response, response.text)
             video_data = json_data(response)
-            media_url = print_video_info(video_data)
+            media_candidates = extract_media_candidates(video_data)
             course_name = video_data.get("course_name") if isinstance(video_data, dict) else None
             replay_title = video_data.get("title") if isinstance(video_data, dict) else None
             if not replay_title:
                 replay_title = next(
-                    (item.get("sub_title") for item in subjects
+                    (item.get("sub_title") for item in all_subjects
                      if isinstance(item, dict) and str(item.get("id")) == subject_id),
                     subject_id,
                 )
             default_name = safe_filename(f"{course_name or course_id}_{replay_title}") + ".mp4"
             debug("Media Cookie available:", "yes (value hidden)" if media_cookie else "no")
-            probe_and_optionally_download(session, media_url, media_cookie, default_name)
+            probe_and_optionally_download(session, media_candidates, media_cookie, default_name)
     print("Done. No password, token, or cookie value was printed.")
     return 0
 
 
 def probe_and_optionally_download(
-    session: requests.Session, media_url: str, media_cookie: str,
-    default_name: str = "replay.mp4", duration: float = 0.0,
+    session: requests.Session, candidates: list[dict], media_cookie: str,
+    default_name: str = "replay.mp4",
 ) -> None:
-    if not media_url:
+    if not candidates:
         print("No media URL returned.")
         return
-    debug("== 8. HLS probe/download ==")
-    response = request(
-        session,
-        "GET",
-        media_url,
-        headers={"Cookie": f"_token={media_cookie}"},
-    )
-    debug("Playlist HTTP:", response.status_code, response.reason)
-    debug("Playlist Content-Type:", response.headers.get("Content-Type", ""))
-    if response.ok:
-        lines = [line.strip() for line in response.text.splitlines() if line.strip()]
-        duration = duration or playlist_duration(response.text)
-        debug("Playlist lines:", len(lines), "segment/child references:", sum(not line.startswith("#") for line in lines))
-        tags = [line for line in lines if line.startswith("#")][:8]
-        debug("Playlist first tags:", " | ".join(tags))
+    debug("== 8. Media probe/download ==")
+    headers = {"Cookie": f"_token={media_cookie}"}
+    media = None
+    for candidate in candidates:
+        parsed = urlsplit(candidate["url"])
+        debug(f"Probing {candidate['kind']} candidate: {parsed.netloc}{parsed.path}")
+        media = probe_media(session, candidate, headers)
+        if media:
+            break
+    if not media:
+        print("No usable media URL was returned; download skipped.")
+        return
+    if media["kind"] == "hls":
+        print(
+            f"Found HLS replay: {media['label']}, "
+            f"duration {format_time(media['duration'])}"
+        )
     else:
-        print("Playlist request failed; download skipped.")
-        return
-    answer = input("Download this replay with ffmpeg? [y/N]: ").strip().lower()
+        size = f" {format_bytes(media['size'])}" if media["size"] else ""
+        print(f"Found direct media: {media['label']} ({media['content_type']}{size})")
+    answer = input("Download/resume this replay? [y/N]: ").strip().lower()
     if answer != "y":
-        return
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        print("ffmpeg not found in PATH.")
         return
     output = input(f"Output file [{default_name}]: ").strip() or default_name
     output_path = Path(output).expanduser()
-    cookie_header = f"Cookie: _token={media_cookie}\r\n"
-    command = [
-        ffmpeg, "-hide_banner", "-y", "-headers", cookie_header,
-        "-i", media_url, "-c", "copy", str(output_path),
-    ]
-    print("Starting ffmpeg; URL and cookie are hidden.")
-    result_code = run_ffmpeg_with_progress(command, duration)
-    print("ffmpeg exit code:", result_code)
-    if result_code == 0:
-        print("Saved:", output_path.resolve())
+    try:
+        if media["kind"] == "hls":
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                print("ffmpeg not found in PATH; HLS download requires it.")
+                return
+            resumable_hls_download(
+                session, media["playlist_url"], media_cookie, output_path, ffmpeg,
+                (media["playlist_url"], media["body"]),
+            )
+        else:
+            resumable_file_download(
+                session, media["url"], media_cookie, output_path, media["size"],
+            )
+    except Exception as exc:
+        print(f"Download failed: {type(exc).__name__}; partial data was kept for resume.")
+        debug(describe_exception(exc))
 
 
 if __name__ == "__main__":
